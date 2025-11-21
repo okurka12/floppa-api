@@ -35,7 +35,7 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 COPY backend/floppa ./floppa
 COPY backend/macky ./macky
 
-COPY backend/config.json ./config.json
+#COPY backend/config.json ./config.json
 
 EXPOSE 8080
 
