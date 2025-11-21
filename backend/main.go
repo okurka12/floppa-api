@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -61,7 +62,7 @@ func main() {
 	}
 
 	r := gin.Default()
-	
+
 	// Serve frontend static files
 	r.Static("/assets", "./frontend/dist/assets")
 	r.StaticFile("/", "./frontend/dist/index.html")
@@ -81,11 +82,21 @@ func main() {
 	})
 
 	r.GET("/macka", func(c *gin.Context) {
-		imageData, _, err := getRandomCat(context.Background(), config.PocketBaseURL)
+		imageData, cat, err := getRandomImageFromCollection(context.Background(), "macky", config.PocketBaseURL)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+
+		// Update views in background to not block response
+		go func(recordID string, currentViews int) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			if err := updateRecordViews(ctx, config.PocketBaseURL, "macky", recordID, currentViews); err != nil {
+				log.Printf("Failed to update views for record %s: %v", recordID, err)
+			}
+		}(cat.ID, cat.Views)
 
 		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 		c.Header("Pragma", "no-cache")
@@ -135,68 +146,69 @@ func getRandomImage() (string, error) {
 
 type CatRecord struct {
 	ID    string `json:"id"`
-	Image string `json:"image"` // The filename
+	Image string `json:"image"`
+	Views int    `json:"views"`
 }
 
 type RandomCatsResponse struct {
 	Items []CatRecord `json:"items"`
 }
 
-func getRandomCat(ctx context.Context, pocketBaseURL string) ([]byte, string, error) {
+func getRandomImageFromCollection(ctx context.Context, collectionName, pocketBaseURL string) ([]byte, CatRecord, error) {
 
-	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/collections/macky/records?perPage=1&sort=@random", pocketBaseURL), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/collections/%s/records?perPage=1&sort=@random", pocketBaseURL, collectionName), nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create request: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to fetch random record: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to fetch random record: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		return nil, CatRecord{}, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
 	}
 
 	var randomResp RandomCatsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&randomResp); err != nil {
-		return nil, "", fmt.Errorf("failed to decode response: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	if len(randomResp.Items) == 0 {
-		return nil, "", fmt.Errorf("no cat records found in collection")
+		return nil, CatRecord{}, fmt.Errorf("no cat records found in collection")
 	}
 
 	cat := randomResp.Items[0]
 	if cat.Image == "" {
-		return nil, "", fmt.Errorf("record has no image field")
+		return nil, CatRecord{}, fmt.Errorf("record has no image field")
 	}
 
-	req, err = http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/files/macky/%s/%s", pocketBaseURL, cat.ID, cat.Image), nil)
+	req, err = http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/files/%s/%s/%s", pocketBaseURL, collectionName, cat.ID, cat.Image), nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to create image request: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to create image request: %w", err)
 	}
 
 	resp, err = client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to download image: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to download image: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("image download error %d: %s", resp.StatusCode, string(body))
+		return nil, CatRecord{}, fmt.Errorf("image download error %d: %s", resp.StatusCode, string(body))
 	}
 
 	imageData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to read image data: %w", err)
+		return nil, CatRecord{}, fmt.Errorf("failed to read image data: %w", err)
 	}
 
-	return imageData, cat.Image, nil
+	return imageData, cat, nil
 }
 
 type CollectionStats struct {
@@ -231,6 +243,36 @@ func getCollectionCount(ctx context.Context, pocketBaseURL, collectionName strin
 	}
 
 	return stats.TotalItems, nil
+}
+
+func updateRecordViews(ctx context.Context, pocketBaseURL, collectionName, recordID string, views int) error {
+	payload := map[string]int{"views": views + 1}
+	bodyBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PATCH", fmt.Sprintf("%s/api/collections/%s/records/%s", pocketBaseURL, collectionName, recordID), bytes.NewBuffer(bodyBytes))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 func isImageFile(filename string) bool {
