@@ -1,17 +1,44 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
+type Config struct {
+	PocketBaseURL string `json:"pocketbase_url"`
+}
+
+func loadConfig() (*Config, error) {
+	file, err := os.Open("config.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config.json: %w", err)
+	}
+	defer file.Close()
+
+	var config Config
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode config.json: %w", err)
+	}
+
+	return &config, nil
+}
+
 func main() {
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
 
 	r := gin.Default()
 
@@ -27,6 +54,20 @@ func main() {
 		c.Header("Expires", "0")
 
 		c.File(imagePath)
+	})
+
+	r.GET("/macka", func(c *gin.Context) {
+		imageData, _, err := getRandomCat(context.Background(), config.PocketBaseURL)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+		c.Header("Pragma", "no-cache")
+		c.Header("Expires", "0")
+
+		c.Data(http.StatusOK, "image/jpeg", imageData)
 	})
 
 	log.Println("Server starting on :8080")
@@ -56,6 +97,72 @@ func getRandomImage() (string, error) {
 	selectedImage := imageFiles[randomIndex]
 
 	return filepath.Join(floppaDir, selectedImage), nil
+}
+
+type CatRecord struct {
+	ID    string `json:"id"`
+	Image string `json:"image"` // The filename
+}
+
+type RandomCatsResponse struct {
+	Items []CatRecord `json:"items"`
+}
+
+func getRandomCat(ctx context.Context, pocketBaseURL string) ([]byte, string, error) {
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/collections/macky/records?perPage=1&sort=@random", pocketBaseURL), nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to fetch random record: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+	}
+
+	var randomResp RandomCatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&randomResp); err != nil {
+		return nil, "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if len(randomResp.Items) == 0 {
+		return nil, "", fmt.Errorf("no cat records found in collection")
+	}
+
+	cat := randomResp.Items[0]
+	if cat.Image == "" {
+		return nil, "", fmt.Errorf("record has no image field")
+	}
+
+	req, err = http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/files/macky/%s/%s", pocketBaseURL, cat.ID, cat.Image), nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create image request: %w", err)
+	}
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("image download error %d: %s", resp.StatusCode, string(body))
+	}
+
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read image data: %w", err)
+	}
+
+	return imageData, cat.Image, nil
 }
 
 func isImageFile(filename string) bool {
